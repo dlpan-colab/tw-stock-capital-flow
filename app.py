@@ -7,37 +7,79 @@ import zoneinfo
 import sqlite3
 import requests
 import json
+from typing import Tuple, List
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from typing import Tuple, List
 import streamlit as st
 import streamlit.components.v1 as components
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 # ================= 0. 版本識別與參數設定 =================
 tw_tz = zoneinfo.ZoneInfo("Asia/Taipei")
-VERSION_TAG = f"v{datetime.datetime.now(tw_tz).strftime('%Y%m%d_%H%M%S')}"
+VERSION_TAG = "v20261013_2007"
 RESET_STOCK_DATA = False
 TARGET_DAYS = 240
-
 EXCLUDE_PARENT_INDUSTRIES = ['合計', '總計', '電子', '電子類', '化學生技醫療']
 
-st.set_page_config(page_title="台股類股資金趨勢", layout="wide")
+# ================= 1. Google Drive 資料庫同步 =================
+@st.cache_resource(ttl=1800, show_spinner="正在從 Google Drive 同步資料庫...")
+def sync_db_from_drive(local_db_path: str) -> bool:
+    """自 Google Drive 下載最新的 tw_market_data.db 至 Streamlit 本地環境"""
+    if "gcp_service_account" not in st.secrets:
+        return False
 
-# ================= 1. 環境與終端裝置偵測 =================
-def detect_runtime_and_device() -> Tuple[str, str, str]:
+    try:
+        creds_info = dict(st.secrets["gcp_service_account"])
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+        service = build("drive", "v3", credentials=creds)
+
+        folder_id = st.secrets.get("FOLDER_ID")
+        query = f"'{folder_id}' in parents and name = 'tw_market_data.db' and trashed = false"
+
+        results = service.files().list(q=query, spaces="drive", fields="files(id, name, modifiedTime)").execute()
+        files = results.get("files", [])
+
+        if not files:
+            st.warning("⚠️ Google Drive 資料夾中未搜尋到 tw_market_data.db")
+            return False
+
+        file_id = files[0]["id"]
+        os.makedirs(os.path.dirname(local_db_path), exist_ok=True)
+
+        request = service.files().get_media(fileId=file_id)
+        with io.FileIO(local_db_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        return True
+    except Exception as e:
+        st.error(f"從 Google Drive 同步資料庫時發生錯誤: {e}")
+        return False
+
+# ================= 2. 環境偵測 =================
+def detect_runtime_environment() -> Tuple[str, str, str, bool]:
+    is_streamlit = True
     env = 'Streamlit 部署環境'
     data_dir = './data'
     device_type = "手機 (Mobile)"
     os.makedirs(data_dir, exist_ok=True)
-    return env, device_type, data_dir
+    return env, device_type, data_dir, is_streamlit
 
-# ================= 2. 資料庫初始化 =================
+# ================= 3. 資料庫初始化 =================
 def init_database(data_dir: str) -> sqlite3.Connection:
     db_path = os.path.join(data_dir, "tw_market_data.db")
+    sync_db_from_drive(db_path)
+
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cursor = conn.cursor()
-    
+
     if RESET_STOCK_DATA:
         cursor.execute("DROP TABLE IF EXISTS daily_stock_turnover")
         cursor.execute("DROP TABLE IF EXISTS daily_industry_ratio")
@@ -127,7 +169,7 @@ def format_date_str(d_str: str) -> str:
     clean_d = str(d_str).replace('-', '').replace('/', '').strip()
     return f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}" if len(clean_d) == 8 else d_str
 
-# ================= 3. 產業對照表建立 =================
+# ================= 4. 產業對照表建立 =================
 def sync_stock_industry_map(conn: sqlite3.Connection) -> pd.DataFrame:
     df_existing = pd.read_sql("SELECT * FROM stock_industry_map", conn)
     if not df_existing.empty:
@@ -135,7 +177,6 @@ def sync_stock_industry_map(conn: sqlite3.Connection) -> pd.DataFrame:
 
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     records = []
-
     for str_mode, market_name in [(2, '上市'), (4, '上櫃')]:
         url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={str_mode}"
         try:
@@ -145,7 +186,6 @@ def sync_stock_industry_map(conn: sqlite3.Connection) -> pd.DataFrame:
             df_table = tables[0]
             df_table.columns = df_table.iloc[0]
             df_table = df_table.iloc[1:].copy()
-
             for _, row in df_table.iterrows():
                 raw_code_name = str(row.get('有價證券代號及名稱', ''))
                 industry = str(row.get('產業別', '')).strip()
@@ -169,7 +209,7 @@ def sync_stock_industry_map(conn: sqlite3.Connection) -> pd.DataFrame:
         return df_map
     return pd.DataFrame()
 
-# ================= 4. 連線與數據抓取 =================
+# ================= 5. 資料抓取與補齊 =================
 session = requests.Session()
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -180,9 +220,9 @@ session.headers.update({
 def fetch_twse_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     norm_date = format_date_str(date_str)
     raw_date = date_str.replace('-', '')
-    
     url_stk = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={raw_date}&type=ALLBUT0999&response=json"
     stock_dict = {}
+
     try:
         res_s = session.get(url_stk, timeout=12)
         if res_s.status_code == 200:
@@ -196,7 +236,7 @@ def fetch_twse_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
                     if "每日收盤行情" in t.get('title', ''):
                         stock_rows = t.get('data', [])
                         break
-            
+
             for r in stock_rows:
                 if len(r) >= 11:
                     code, name = str(r[0]).strip(), str(r[1]).strip()
@@ -210,7 +250,6 @@ def fetch_twse_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
                                 diff = -diff
                             elif '+' in sign:
                                 diff = abs(diff)
-
                             prev_p = close_p - diff
                             change_rate = (diff / prev_p * 100.0) if prev_p > 0 else 0.0
 
@@ -257,7 +296,6 @@ def fetch_twse_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
         pass
 
     df_stock = pd.DataFrame(list(stock_dict.values()))
-
     df_ind = pd.DataFrame(columns=['industry', 'clean_ind', 'trade_value', 'value_ratio', 'date', 'market'])
     if not df_stock.empty and not df_map.empty:
         df_m = pd.merge(df_stock, df_map[['code', 'industry', 'clean_ind']], on='code', how='inner')
@@ -284,9 +322,9 @@ def fetch_twse_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
 def fetch_tpex_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     norm_date = format_date_str(date_str)
     roc_d = to_roc_date_slash(norm_date)
-    
     url_stk = f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={roc_d}&se=EW&response=json"
     stock_dict = {}
+
     try:
         res = session.get(url_stk, timeout=12)
         if res.status_code == 200:
@@ -300,7 +338,6 @@ def fetch_tpex_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
                             amt = float(str(r[8]).replace(',', '').strip() or 0)
                             close_str = str(r[2]).replace(',', '').strip()
                             close_p = float(close_str) if close_str and close_str != '---' else 0.0
-
                             diff_raw = str(r[3]).strip()
                             diff_val = float(diff_raw.replace('+', '').replace('-', '').replace(',', '').replace('<font color=red>', '').replace('<font color=green>', '').replace('</font>', '').strip() or 0)
                             if '-' in diff_raw or 'green' in diff_raw:
@@ -309,7 +346,6 @@ def fetch_tpex_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
                                 diff = diff_val
                             else:
                                 diff = 0.0
-
                             prev_p = close_p - diff
                             change_rate = (diff / prev_p * 100.0) if prev_p > 0 else 0.0
 
@@ -358,10 +394,9 @@ def fetch_tpex_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
         pass
 
     df_stock = pd.DataFrame(list(stock_dict.values()))
-    
     df_ind = pd.DataFrame(columns=['industry', 'clean_ind', 'trade_value', 'value_ratio', 'date', 'market'])
     df_chips = pd.DataFrame(columns=['date', 'market', 'clean_ind', 'foreign_buy_net', 'trust_buy_net', 'inst_total_net'])
-    
+
     if not df_stock.empty and not df_map.empty:
         df_merged = pd.merge(df_stock, df_map[['code', 'clean_ind']], on='code', how='inner')
         if not df_merged.empty:
@@ -380,7 +415,7 @@ def fetch_tpex_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
 
     return df_ind, df_stock, df_chips
 
-# ================= 5. 資料同步排程 =================
+# ================= 6. 資料同步邏輯 =================
 def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     cursor = conn.cursor()
     cursor.execute("DELETE FROM daily_industry_ratio WHERE date = '2026-10-09' OR trade_value <= 0")
@@ -396,20 +431,18 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
 
     tw_valid_days = set(df_hist_stock[(df_hist_stock['market'] == '上市') & (df_hist_stock['change_rate'] > 0)]['date'].dropna().unique())
     tp_valid_days = set(df_hist_stock[(df_hist_stock['market'] == '上櫃') & (df_hist_stock['change_rate'] > 0)]['date'].dropna().unique())
-
     tw_days = set(df_hist_ind[df_hist_ind['market'] == '上市']['date'].dropna().unique()) if not df_hist_ind.empty else set()
     tp_days = set(df_hist_ind[df_hist_ind['market'] == '上櫃']['date'].dropna().unique()) if not df_hist_ind.empty else set()
 
     now_dt = datetime.datetime.now(tw_tz)
     check_ptr = now_dt if now_dt.hour >= 15 else now_dt - datetime.timedelta(days=1)
-    
+
     latest_tw = max(tw_days) if tw_days else "2024-01-01"
     latest_tp = max(tp_days) if tp_days else "2024-01-01"
-
     missing_dates = []
-
     ptr = check_ptr
-    while ptr.strftime('%Y-%m-%d') >= min(latest_tw, latest_tp):
+
+    while ptr.strftime('%Y-%m-%d') >= min(latest_tw, latest_tp) and len(missing_dates) < target_valid_days:
         d_str = ptr.strftime('%Y%m%d')
         d_f = format_date_str(d_str)
         if ptr.weekday() < 5 and d_f != '2026-10-09':
@@ -417,16 +450,6 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
                 if d_str not in missing_dates:
                     missing_dates.append(d_str)
         ptr -= datetime.timedelta(days=1)
-
-    if len(tw_valid_days) < target_valid_days or len(tp_valid_days) < target_valid_days:
-        all_hist_dates = sorted(list(tw_days.union(tp_days)), reverse=True)
-        for d_f in all_hist_dates:
-            d_str = d_f.replace('-', '')
-            if (d_f not in tw_valid_days) or (d_f not in tp_valid_days):
-                if d_str not in missing_dates:
-                    missing_dates.append(d_str)
-            if len(missing_dates) >= 30:
-                break
 
     if missing_dates:
         for d in missing_dates:
@@ -436,11 +459,11 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
 
             if d_formatted not in tw_valid_days:
                 df_tw_i, df_tw_s, df_tw_c = fetch_twse_day_data(d, df_map)
-                time.sleep(0.8)
+                time.sleep(0.5)
 
             if d_formatted not in tp_valid_days:
                 df_tp_i, df_tp_s, df_tp_c = fetch_tpex_day_data(d, df_map)
-                time.sleep(0.8)
+                time.sleep(0.5)
 
             day_inds = [df for df in [df_tw_i, df_tp_i] if not df.empty and df['trade_value'].sum() > 0]
             day_stocks = [df for df in [df_tw_s, df_tp_s] if not df.empty and df['trade_value'].sum() > 0]
@@ -477,13 +500,13 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
             if has_new_write:
                 conn.commit()
 
-    df_hist_ind = pd.read_sql("SELECT * FROM daily_industry_ratio WHERE trade_value > 0", conn)
-    df_hist_stock = pd.read_sql("SELECT * FROM daily_stock_turnover WHERE trade_value > 0", conn)
-    df_hist_chips = pd.read_sql("SELECT * FROM daily_industry_chips", conn)
-    
+        df_hist_ind = pd.read_sql("SELECT * FROM daily_industry_ratio WHERE trade_value > 0", conn)
+        df_hist_stock = pd.read_sql("SELECT * FROM daily_stock_turnover WHERE trade_value > 0", conn)
+        df_hist_chips = pd.read_sql("SELECT * FROM daily_industry_chips", conn)
+
     return df_hist_ind, df_hist_stock, df_hist_chips, df_map
 
-# ================= 6. 漲幅前 100 名產業佔比 =================
+# ================= 7. 漲幅前 100 名產業佔比 =================
 def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_map: pd.DataFrame) -> pd.DataFrame:
     cursor = conn.cursor()
     df_exist = pd.read_sql("SELECT * FROM daily_top_gainers_ratio", conn)
@@ -506,7 +529,7 @@ def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_ma
             valid_gainers = sub_day[sub_day['change_rate'] > 0]
             if valid_gainers.empty:
                 continue
-            
+
             top100 = valid_gainers.sort_values(by='change_rate', ascending=False).head(100)
             tot_val = top100['trade_value'].sum()
             if tot_val > 0:
@@ -520,7 +543,7 @@ def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_ma
                         'trade_value': ind_val,
                         'value_ratio': (ind_val / tot_val) * 100.0
                     })
-        
+
         if new_records:
             df_new = pd.DataFrame(new_records)
             for _, r in df_new.iterrows():
@@ -533,7 +556,7 @@ def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_ma
     df_final = pd.read_sql("SELECT * FROM daily_top_gainers_ratio", conn)
     return df_final
 
-# ================= 7. 多模式 Plotly 圖表生成 =================
+# ================= 8. Plotly 圖表生成 =================
 def render_plotly_with_infobar(
     df_ind: pd.DataFrame, 
     df_stk: pd.DataFrame, 
@@ -543,9 +566,9 @@ def render_plotly_with_infobar(
     market_name: str, 
     device_type: str, 
     mode_option: str,
-    chart_id: str
+    chart_id: str,
+    is_streamlit: bool = True
 ) -> None:
-    
     mode_configs = {
         '1': {'col': 'value_ratio', 'title': '全市場類股成交比率 (%)', 'suffix': '%', 'scale': 1.0},
         '2': {'col': 'foreign_buy_net', 'title': '外資買賣超金額 (億元)', 'suffix': '億', 'scale': 1e8},
@@ -554,7 +577,7 @@ def render_plotly_with_infobar(
         '5': {'col': 'value_ratio', 'title': '漲幅前100名個股產業佔比 (%)', 'suffix': '%', 'scale': 1.0},
     }
     cfg = mode_configs.get(mode_option, mode_configs['1'])
-    
+
     if mode_option == '1':
         df_target = df_ind[
             (df_ind['market'] == market_name) & 
@@ -574,7 +597,7 @@ def render_plotly_with_infobar(
             df_target['industry'] = df_target['clean_ind']
 
     if df_target.empty or 'date' not in df_target.columns:
-        st.warning(f"{market_name} 查無資料")
+        st.info(f"{market_name} 查無相關資料")
         return
 
     today_str = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d')
@@ -587,7 +610,7 @@ def render_plotly_with_infobar(
     dates = sorted(df_target['date'].dropna().unique().tolist())
     n_days = len(dates)
     if n_days == 0:
-        st.warning(f"{market_name} 查無有效交易日")
+        st.info(f"{market_name} 查無有效交易日")
         return
 
     tick_texts = []
@@ -617,9 +640,9 @@ def render_plotly_with_infobar(
 
     latest_date = max(dates)
     init_info_text = daily_summary_dict.get(latest_date, "")
-
     recent_dates = dates[-default_days_count:] if n_days > default_days_count else dates
     df_recent = df_target[df_target['date'].isin(recent_dates)]
+
     if not df_recent.empty:
         y_min = float(df_recent['metric_val'].min())
         y_max = float(df_recent['metric_val'].max())
@@ -647,11 +670,11 @@ def render_plotly_with_infobar(
                 top100_day = day_all[day_all['change_rate'] > 0].sort_values(by='change_rate', ascending=False).head(100)
                 sub_top100 = top100_day[top100_day['clean_ind'] == c_ind]
                 top3 = sub_top100.sort_values(by='change_rate', ascending=False).head(3)
-                details = "<br>".join([f"  {r['code']}{r['name']}: {r['change_rate']:+.2f}% ({r['trade_value']/1e8:.2f}億)" for _, r in top3.iterrows()])
+                details = "<br>".join([f"  {r['code']} {r['name']}: {r['change_rate']:+.2f}% ({r['trade_value'] / 1e8:.2f}億)" for _, r in top3.iterrows()])
                 stock_top3_dict[(d, c_ind)] = f"前三大漲幅強勢股:<br>{details}" if details else "  (無進榜個股)"
             elif mode_option == '1':
                 top3 = sub_df.sort_values(by='trade_value', ascending=False).head(3)
-                details = "<br>".join([f"  {r['code']}{r['name']}: {r['trade_value']/1e8:.2f}億" for _, r in top3.iterrows()])
+                details = "<br>".join([f"  {r['code']} {r['name']}: {r['trade_value'] / 1e8:.2f}億" for _, r in top3.iterrows()])
                 stock_top3_dict[(d, c_ind)] = f"前三大成交個股:<br>{details}"
             else:
                 rank_col = 'foreign_buy_net' if mode_option == '2' else 'inst_total_net'
@@ -659,11 +682,11 @@ def render_plotly_with_infobar(
                 metric_sum = sub_target['metric_val'].iloc[0] if not sub_target.empty else 0.0
                 if metric_sum < 0:
                     top3_sell = sub_df.sort_values(by=rank_col, ascending=True).head(3)
-                    details = "<br>".join([f"  {r['code']}{r['name']}: {r[rank_col]/1e8:.2f}億" for _, r in top3_sell.iterrows()])
+                    details = "<br>".join([f"  {r['code']} {r['name']}: {r[rank_col] / 1e8:.2f}億" for _, r in top3_sell.iterrows()])
                     stock_top3_dict[(d, c_ind)] = f"前三大賣超個股:<br>{details}"
                 else:
                     top3_buy = sub_df.sort_values(by=rank_col, ascending=False).head(3)
-                    details = "<br>".join([f"  {r['code']}{r['name']}: {r[rank_col]/1e8:.2f}億" for _, r in top3_buy.iterrows()])
+                    details = "<br>".join([f"  {r['code']} {r['name']}: {r[rank_col] / 1e8:.2f}億" for _, r in top3_buy.iterrows()])
                     stock_top3_dict[(d, c_ind)] = f"前三大買超個股:<br>{details}"
 
     fig = go.Figure()
@@ -686,13 +709,11 @@ def render_plotly_with_infobar(
     end_x_idx = latest_x_idx + 0.5
     default_x_range = [start_x_idx, end_x_idx]
 
-    c_width = 380 if is_mobile else 1050
     c_height = 600 if is_mobile else 620
-
     fig.update_layout(
         title=dict(
-            text=f"{market_name} {cfg['title']} 走勢圖 (檢視期程: {default_days_count} 交易日)", 
-            x=0.02, 
+            text=f"{market_name} {cfg['title']} 走勢圖 (檢視期程: {default_days_count} 交易日)",
+            x=0.02,
             y=0.98,
             font=dict(size=14)
         ),
@@ -749,6 +770,7 @@ def render_plotly_with_infobar(
         'modeBarButtonsToRemove': ['zoomIn2d', 'zoomOut2d', 'resetScale2d'],
         'responsive': True
     }
+
     plotly_div_html = fig.to_html(
         include_plotlyjs='cdn',
         full_html=False,
@@ -757,7 +779,6 @@ def render_plotly_with_infobar(
     )
 
     dict_json = json.dumps(daily_summary_dict, ensure_ascii=False)
-    
     wrapper_html = f"""
     <div style="width: 100%; margin-bottom: 25px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
         <div id="info_{chart_id}" style="width: 100%; min-height: 26px; padding: 6px 12px; box-sizing: border-box; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; font-size: 11px; font-family: monospace; color: #24292f; white-space: nowrap; overflow-x: auto; margin-bottom: 6px;">
@@ -787,10 +808,9 @@ def render_plotly_with_infobar(
     """
     components.html(wrapper_html, height=c_height + 80, scrolling=True)
 
-# ================= 8. 匯出 Excel =================
+# ================= 9. 匯出 Excel =================
 def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFrame, data_dir: str, mode_option: str) -> str:
     now = datetime.datetime.now(tw_tz)
-
     mode_name_map = {
         '1': '全市場成交比率',
         '2': '外資買賣超',
@@ -799,10 +819,8 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
         '5': '漲幅前百大產業'
     }
     func_name = mode_name_map.get(mode_option, '全市場成交比率')
-
     dates = sorted(df_ind['date'].dropna().unique(), reverse=True) if 'date' in df_ind.columns else []
     latest_data_date = dates[0].replace('-', '') if dates else '無資料'
-
     filename = f"{func_name}_{latest_data_date}_{now.strftime('%Y%m%d%H%M')}.xlsx"
     export_path = os.path.join(data_dir, filename)
 
@@ -826,7 +844,6 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
                 (~df_ind['industry'].isin(EXCLUDE_PARENT_INDUSTRIES))
             ].sort_values(by='value_ratio', ascending=False)
             top4 = sub_i.head(4)
-
             for rank, (_, row) in enumerate(top4.iterrows(), 1):
                 i_name = row['industry']
                 c_name = normalize_industry_name(i_name)
@@ -837,7 +854,7 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
                     sub_s = df_stk_m[(df_stk_m['date'] == d) & (df_stk_m['market'] == market) & (df_stk_m['clean_ind'] == c_name)]
                     top5_df = sub_s.sort_values(by='trade_value', ascending=False).head(5)
                     for idx, (_, s_row) in enumerate(top5_df.iterrows()):
-                        top5_stocks[idx] = f"{s_row['code']}{s_row['name']}({s_row['trade_value']/1e8:.2f}億)"
+                        top5_stocks[idx] = f"{s_row['code']}{s_row['name']}({s_row['trade_value'] / 1e8:.2f}億)"
 
                 records_turnover.append({
                     '交易日期': d,
@@ -851,7 +868,6 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
                     '成交第4名個股': top5_stocks[3],
                     '成交第5名個股': top5_stocks[4],
                 })
-
     df_out_turnover = pd.DataFrame(records_turnover)
 
     records_gainers = []
@@ -878,7 +894,6 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
             for rank, (_, i_row) in enumerate(top5_inds.iterrows(), 1):
                 c_name = i_row['clean_ind']
                 ratio = i_row['value_ratio']
-                
                 sub_ind_top = top100_day[top100_day['clean_ind'] == c_name].sort_values(by='change_rate', ascending=False)
                 
                 row_dict = {
@@ -889,12 +904,10 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
                     '前100名成交市值佔比(%)': ratio,
                     '進榜檔數': len(sub_ind_top),
                 }
-                
                 for idx, (_, s_row) in enumerate(sub_ind_top.iterrows(), 1):
-                    row_dict[f'第{idx}檔個股'] = f"{s_row['code']}{s_row['name']}({s_row['change_rate']:+.2f}%, {s_row['trade_value']/1e8:.2f}億)"
+                    row_dict[f'第{idx}檔個股'] = f"{s_row['code']}{s_row['name']}({s_row['change_rate']:+.2f}%, {s_row['trade_value'] / 1e8:.2f}億)"
                 
                 records_gainers.append(row_dict)
-
     df_out_gainers = pd.DataFrame(records_gainers)
 
     with pd.ExcelWriter(export_path, engine='openpyxl') as writer:
@@ -904,15 +917,22 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
 
     return export_path
 
-# ================= 9. Streamlit 進入點 =================
-def main():
-    st.title("📈 台股類股資金趨勢分析系統")
-    env, device_type, data_dir = detect_runtime_and_device()
+# ================= 10. 主程式執行邏輯 =================
+def run():
+    st.set_page_config(page_title="台股類股資金趨勢", layout="wide")
+    
+    # 側邊欄：重新整理與設定
+    with st.sidebar:
+        st.header("⚙️ 系統設定")
+        if st.button("🔄 強制自雲端重新同步資料庫"):
+            st.cache_resource.clear()
+            st.rerun()
 
-    with st.spinner("同步資料庫中，請稍候..."):
-        conn = init_database(data_dir)
-        df_ind, df_stk, df_chips, df_map = load_or_sync_data(conn, target_valid_days=TARGET_DAYS)
-        df_gainers = sync_top_gainers_ratio(conn, df_stk, df_map)
+    env, device_type, data_dir, is_streamlit = detect_runtime_environment()
+    
+    conn = init_database(data_dir)
+    df_ind, df_stk, df_chips, df_map = load_or_sync_data(conn, target_valid_days=TARGET_DAYS)
+    df_gainers = sync_top_gainers_ratio(conn, df_stk, df_map)
 
     mode_options = {
         "5": "5. 每日漲幅前100名個股產業佔比走勢圖 (%)",
@@ -921,6 +941,9 @@ def main():
         "3": "3. 各類股三大法人合計買賣超金額走勢圖 (億元)",
         "4": "4. 各類股主力籌碼指標走勢圖 (億元)"
     }
+
+    st.title("📈 台股類股資金趨勢分析系統")
+    st.caption(f"系統核心版本：{VERSION_TAG}")
     
     selected_label = st.selectbox(
         "請選擇檢視指標：", 
@@ -930,10 +953,10 @@ def main():
     user_choice = [k for k, v in mode_options.items() if v == selected_label][0]
 
     st.subheader("上市市場")
-    render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上市', device_type, user_choice, chart_id='tw')
+    render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上市', device_type, user_choice, chart_id='tw', is_streamlit=True)
     
     st.subheader("上櫃市場")
-    render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上櫃', device_type, user_choice, chart_id='tp')
+    render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上櫃', device_type, user_choice, chart_id='tp', is_streamlit=True)
 
     excel_path = export_excel(df_ind, df_stk, df_map, data_dir, user_choice)
     with open(excel_path, "rb") as f:
@@ -946,4 +969,4 @@ def main():
     conn.close()
 
 if __name__ == "__main__":
-    main()
+    run()
