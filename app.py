@@ -28,14 +28,10 @@ if IS_COLAB:
 
 # ================= 1. 版本識別與參數設定 =================
 tw_tz = zoneinfo.ZoneInfo("Asia/Taipei")
-VERSION_TAG = "v20261013_2158"
+VERSION_TAG = "v20261013_2220"
 RESET_STOCK_DATA = False
 TARGET_DAYS = 240
 EXCLUDE_PARENT_INDUSTRIES = ['合計', '總計', '電子', '電子類', '化學生技醫療']
-
-# Colab 表單互動參數 (在 Streamlit 中會由 st.selectbox 接管)
-# @title 台股類股資金趨勢分析系統 { run: "auto" }
-SELECTED_MODE_LABEL = "5. 每日漲幅前100名個股產業佔比走勢圖 (%)" # @param ["5. 每日漲幅前100名個股產業佔比走勢圖 (%)", "1. 全市場類股成交金額比率走勢圖 (%)", "2. 各類股外資買賣超金額走勢圖 (億元)", "3. 各類股三大法人合計買賣超金額走勢圖 (億元)", "4. 各類股主力籌碼指標走勢圖 (億元)"]
 
 # ================= 2. 跨環境快取包裝器 =================
 def cross_env_cache(*args, **kwargs):
@@ -116,14 +112,17 @@ def detect_runtime_environment() -> Tuple[str, str, str, bool]:
     os.makedirs(data_dir, exist_ok=True)
     return env, device_type, data_dir, is_streamlit
 
-# ================= 5. 資料庫初始化 =================
+# ================= 5. 資料庫初始化 (啟用 WAL 與防止鎖定) =================
 def init_database(data_dir: str, is_streamlit: bool) -> sqlite3.Connection:
     db_path = os.path.join(data_dir, "tw_market_data.db")
     if is_streamlit:
         sync_db_from_drive(db_path)
 
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    # 設置 30 秒 timeout 與 WAL 模式，避免多執行緒或重新載入時鎖定報錯
+    conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA busy_timeout=30000;")
 
     if RESET_STOCK_DATA:
         cursor.execute("DROP TABLE IF EXISTS daily_stock_turnover")
@@ -601,7 +600,17 @@ def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_ma
     df_final = pd.read_sql("SELECT * FROM daily_top_gainers_ratio", conn)
     return df_final
 
-# ================= 10. Plotly 圖表生成 =================
+# ================= 10. 資料快取封裝 (避免重複讀寫鎖定) =================
+@cross_env_cache(ttl=600)
+def get_cached_market_data(data_dir: str, is_streamlit: bool):
+    """跨環境快取載入市場資料，操作完成後立即釋放 SQLite 連線"""
+    conn = init_database(data_dir, is_streamlit)
+    df_ind, df_stk, df_chips, df_map = load_or_sync_data(conn, target_valid_days=TARGET_DAYS)
+    df_gainers = sync_top_gainers_ratio(conn, df_stk, df_map)
+    conn.close()
+    return df_ind, df_stk, df_chips, df_map, df_gainers
+
+# ================= 11. Plotly 圖表生成 =================
 def render_plotly_with_infobar(
     df_ind: pd.DataFrame, 
     df_stk: pd.DataFrame, 
@@ -929,7 +938,7 @@ def render_plotly_with_infobar(
     elif IS_COLAB:
         display(HTML(wrapper_html))
 
-# ================= 11. 匯出 Excel =================
+# ================= 12. 匯出 Excel =================
 def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFrame, data_dir: str, mode_option: str) -> str:
     now = datetime.datetime.now(tw_tz)
     mode_name_map = {
@@ -1038,7 +1047,7 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
 
     return export_path
 
-# ================= 12. 主程式執行邏輯 =================
+# ================= 13. 主程式執行邏輯 (方式 B 互動式問答) =================
 def run():
     env, device_type, data_dir, is_streamlit = detect_runtime_environment()
     
@@ -1061,29 +1070,36 @@ def run():
         st.title("📈 台股類股資金趨勢分析系統")
         st.caption(f"系統核心版本：{VERSION_TAG} ({env})")
         
-        default_idx = list(mode_options.values()).index(SELECTED_MODE_LABEL) if SELECTED_MODE_LABEL in mode_options.values() else 0
         selected_label = st.selectbox(
             "請選擇檢視指標：", 
             options=list(mode_options.values()), 
-            index=default_idx
+            index=0
         )
+        user_choice = [k for k, v in mode_options.items() if v == selected_label][0]
     else:
+        # Colab 模式：終端機互動輸入問答
         print("=" * 65)
         print(f"📈 台股類股資金趨勢分析系統 | 核心版本：{VERSION_TAG} ({env})")
         print("=" * 65)
-        selected_label = SELECTED_MODE_LABEL
-        print(f"當前檢視指標：{selected_label}")
+        print("\n請選擇欲檢視之指標編號：")
+        print("  [1] 全市場類股成交金額比率走勢圖 (%)")
+        print("  [2] 各類股外資買賣超金額走勢圖 (億元)")
+        print("  [3] 各類股三大法人合計買賣超金額走勢圖 (億元)")
+        print("  [4] 各類股主力籌碼指標走勢圖 (億元)")
+        print("  [5] 每日漲幅前100名個股產業佔比走勢圖 (%)")
+        
+        raw_input = input("\n請輸入指標代號 (1-5，直接按 Enter 預設為 5)：").strip()
+        user_choice = raw_input if raw_input in mode_options else "5"
+        selected_label = mode_options[user_choice]
+        print(f"\n👉 已選擇指標：{selected_label}\n")
 
-    user_choice = [k for k, v in mode_options.items() if v == selected_label][0]
-
-    conn = init_database(data_dir, is_streamlit)
-    df_ind, df_stk, df_chips, df_map = load_or_sync_data(conn, target_valid_days=TARGET_DAYS)
-    df_gainers = sync_top_gainers_ratio(conn, df_stk, df_map)
+    # 透過快取載入市場資料，避免每次切換重複連線鎖定
+    df_ind, df_stk, df_chips, df_map, df_gainers = get_cached_market_data(data_dir, is_streamlit)
 
     if is_streamlit and st is not None:
         st.subheader("上市市場")
     else:
-        print("\n【上市市場走勢圖】")
+        print("【上市市場走勢圖】")
     render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上市', device_type, user_choice, chart_id='tw', is_streamlit=is_streamlit)
 
     if is_streamlit and st is not None:
@@ -1103,8 +1119,6 @@ def run():
             )
     else:
         print(f"✅ Excel 分析報表已產出至：{excel_path}")
-
-    conn.close()
 
 if __name__ == "__main__":
     run()
