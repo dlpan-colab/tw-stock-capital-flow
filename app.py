@@ -11,7 +11,8 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from typing import Tuple, List
-from IPython.display import display, HTML
+import streamlit as st
+import streamlit.components.v1 as components
 
 # ================= 0. 版本識別與參數設定 =================
 tw_tz = zoneinfo.ZoneInfo("Asia/Taipei")
@@ -21,38 +22,13 @@ TARGET_DAYS = 240
 
 EXCLUDE_PARENT_INDUSTRIES = ['合計', '總計', '電子', '電子類', '化學生技醫療']
 
+st.set_page_config(page_title="台股類股資金趨勢", layout="wide")
+
 # ================= 1. 環境與終端裝置偵測 =================
 def detect_runtime_and_device() -> Tuple[str, str, str]:
-    env = '本地/筆電獨立環境'
+    env = 'Streamlit 部署環境'
     data_dir = './data'
-    device_type = "筆電/桌機 (Desktop)"
-
-    if 'google.colab' in sys.modules:
-        env = 'Colab 雲端環境'
-        from google.colab import drive, output
-        drive_mount = '/content/drive'
-        if not os.path.exists(os.path.join(drive_mount, 'MyDrive')):
-            drive.mount(drive_mount)
-        data_dir = os.path.join(drive_mount, 'MyDrive', 'stock_data')
-        
-        try:
-            ua = output.eval_js('navigator.userAgent').lower()
-            if any(k in ua for k in ['mobile', 'android', 'iphone', 'ipad', 'ipod']):
-                device_type = "手機 (Mobile)"
-            else:
-                device_type = "筆電/桌機 (Desktop)"
-        except Exception:
-            device_type = "筆電/桌機 (Desktop)"
-
-    elif 'streamlit' in sys.modules:
-        env = 'Streamlit 部署環境'
-        data_dir = './data'
-        user_agent = os.environ.get('HTTP_USER_AGENT', '').lower()
-        if any(k in user_agent for k in ['mobile', 'android', 'iphone', 'ipad', 'ipod']):
-            device_type = "手機 (Mobile)"
-        else:
-            device_type = "筆電/桌機 (Desktop)"
-
+    device_type = "手機 (Mobile)"
     os.makedirs(data_dir, exist_ok=True)
     return env, device_type, data_dir
 
@@ -157,7 +133,6 @@ def sync_stock_industry_map(conn: sqlite3.Connection) -> pd.DataFrame:
     if not df_existing.empty:
         return df_existing
 
-    print("自官方 ISIN 建置個股產業資料庫...")
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     records = []
 
@@ -405,7 +380,7 @@ def fetch_tpex_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
 
     return df_ind, df_stock, df_chips
 
-# ================= 5. 資料同步排程（智能對齊、增量寫入與分批回補） =================
+# ================= 5. 資料同步排程 =================
 def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     cursor = conn.cursor()
     cursor.execute("DELETE FROM daily_industry_ratio WHERE date = '2026-10-09' OR trade_value <= 0")
@@ -419,7 +394,6 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
     df_hist_stock = pd.read_sql("SELECT * FROM daily_stock_turnover WHERE trade_value > 0", conn)
     df_hist_chips = pd.read_sql("SELECT * FROM daily_industry_chips", conn)
 
-    # 檢查有真實漲幅 (change_rate > 0) 的有效日
     tw_valid_days = set(df_hist_stock[(df_hist_stock['market'] == '上市') & (df_hist_stock['change_rate'] > 0)]['date'].dropna().unique())
     tp_valid_days = set(df_hist_stock[(df_hist_stock['market'] == '上櫃') & (df_hist_stock['change_rate'] > 0)]['date'].dropna().unique())
 
@@ -429,14 +403,11 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
     now_dt = datetime.datetime.now(tw_tz)
     check_ptr = now_dt if now_dt.hour >= 15 else now_dt - datetime.timedelta(days=1)
     
-    print(f"資料庫狀態 -> 上市已有 {len(tw_days)} 天（最新: {max(tw_days) if tw_days else '無'}），上櫃已有 {len(tp_days)} 天（最新: {max(tp_days) if tp_days else '無'}）")
-
     latest_tw = max(tw_days) if tw_days else "2024-01-01"
     latest_tp = max(tp_days) if tp_days else "2024-01-01"
 
     missing_dates = []
 
-    # 1. 遞增模式：僅掃描最新交易日
     ptr = check_ptr
     while ptr.strftime('%Y-%m-%d') >= min(latest_tw, latest_tp):
         d_str = ptr.strftime('%Y%m%d')
@@ -447,7 +418,6 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
                     missing_dates.append(d_str)
         ptr -= datetime.timedelta(days=1)
 
-    # 2. 歷史回溯：若過去歷史紀錄缺少有效漲幅，自動排入補齊名單（上限 30 天分批回補避免超時）
     if len(tw_valid_days) < target_valid_days or len(tp_valid_days) < target_valid_days:
         all_hist_dates = sorted(list(tw_days.union(tp_days)), reverse=True)
         for d_f in all_hist_dates:
@@ -459,10 +429,8 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
                 break
 
     if missing_dates:
-        print(f"共有 {len(missing_dates)} 個交易日需補齊/校正，開始【擷取一筆、立即寫入一筆】...")
         for d in missing_dates:
             d_formatted = format_date_str(d)
-            
             df_tw_i, df_tw_s, df_tw_c = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
             df_tp_i, df_tp_s, df_tp_c = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -508,9 +476,6 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
 
             if has_new_write:
                 conn.commit()
-                print(f"成功寫入並同步存檔交易日: {d_formatted}")
-    else:
-        print("資料庫已是最新狀態，無需同步。")
 
     df_hist_ind = pd.read_sql("SELECT * FROM daily_industry_ratio WHERE trade_value > 0", conn)
     df_hist_stock = pd.read_sql("SELECT * FROM daily_stock_turnover WHERE trade_value > 0", conn)
@@ -518,7 +483,7 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
     
     return df_hist_ind, df_hist_stock, df_hist_chips, df_map
 
-# ================= 6. 漲幅前 100 名產業佔比（持久化＋增量計算） =================
+# ================= 6. 漲幅前 100 名產業佔比 =================
 def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_map: pd.DataFrame) -> pd.DataFrame:
     cursor = conn.cursor()
     df_exist = pd.read_sql("SELECT * FROM daily_top_gainers_ratio", conn)
@@ -535,7 +500,6 @@ def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_ma
     need_calc_pairs = all_pairs - exist_pairs
 
     if need_calc_pairs:
-        print(f"增量計算新交易日之漲幅前 100 名產業佔比（共 {len(need_calc_pairs)} 個市場交易日）...")
         new_records = []
         for d, market in need_calc_pairs:
             sub_day = df_m[(df_m['date'] == d) & (df_m['market'] == market)]
@@ -565,7 +529,6 @@ def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_ma
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (r['date'], r['market'], r['industry'], r['clean_ind'], r['trade_value'], r['value_ratio']))
             conn.commit()
-            print("新交易日漲幅佔比已成功持久化寫入資料庫！")
 
     df_final = pd.read_sql("SELECT * FROM daily_top_gainers_ratio", conn)
     return df_final
@@ -611,7 +574,7 @@ def render_plotly_with_infobar(
             df_target['industry'] = df_target['clean_ind']
 
     if df_target.empty or 'date' not in df_target.columns:
-        print(f"{market_name} 查無資料")
+        st.warning(f"{market_name} 查無資料")
         return
 
     today_str = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d')
@@ -624,7 +587,7 @@ def render_plotly_with_infobar(
     dates = sorted(df_target['date'].dropna().unique().tolist())
     n_days = len(dates)
     if n_days == 0:
-        print(f"{market_name} 查無有效交易日")
+        st.warning(f"{market_name} 查無有效交易日")
         return
 
     tick_texts = []
@@ -723,8 +686,8 @@ def render_plotly_with_infobar(
     end_x_idx = latest_x_idx + 0.5
     default_x_range = [start_x_idx, end_x_idx]
 
-    c_width = 720 if is_mobile else 1050
-    c_height = 680 if is_mobile else 620
+    c_width = 380 if is_mobile else 1050
+    c_height = 600 if is_mobile else 620
 
     fig.update_layout(
         title=dict(
@@ -733,9 +696,9 @@ def render_plotly_with_infobar(
             y=0.98,
             font=dict(size=14)
         ),
-        width=c_width,
+        width=None,
         height=c_height,
-        autosize=False,
+        autosize=True,
         dragmode="pan",
         showlegend=True,
         legend=dict(
@@ -777,7 +740,7 @@ def render_plotly_with_infobar(
         ),
         hovermode="closest",
         template="plotly_white",
-        margin=dict(l=55, r=20, t=60, b=140)
+        margin=dict(l=45, r=15, t=50, b=120)
     )
 
     chart_config = {
@@ -796,7 +759,7 @@ def render_plotly_with_infobar(
     dict_json = json.dumps(daily_summary_dict, ensure_ascii=False)
     
     wrapper_html = f"""
-    <div style="width: {c_width}px; margin-bottom: 25px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+    <div style="width: 100%; margin-bottom: 25px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
         <div id="info_{chart_id}" style="width: 100%; min-height: 26px; padding: 6px 12px; box-sizing: border-box; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; font-size: 11px; font-family: monospace; color: #24292f; white-space: nowrap; overflow-x: auto; margin-bottom: 6px;">
             {init_info_text}
         </div>
@@ -822,9 +785,9 @@ def render_plotly_with_infobar(
     }})();
     </script>
     """
-    display(HTML(wrapper_html))
+    components.html(wrapper_html, height=c_height + 80, scrolling=True)
 
-# ================= 8. 匯出 Excel（檔名標註功能簡述、保留交易日期、無版本識別） =================
+# ================= 8. 匯出 Excel =================
 def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFrame, data_dir: str, mode_option: str) -> str:
     now = datetime.datetime.now(tw_tz)
 
@@ -854,7 +817,6 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
     if 'change_rate' not in df_stk_m.columns:
         df_stk_m['change_rate'] = 0.0
 
-    # 工作表 1: 類股成交資金流動
     records_turnover = []
     for d in dates:
         for market in ['上市', '上櫃']:
@@ -892,7 +854,6 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
 
     df_out_turnover = pd.DataFrame(records_turnover)
 
-    # 工作表 2: 當日漲幅前100名個股產業資金比率（嚴格排除 0% 與負數，每檔個股獨立單獨欄位）
     records_gainers = []
     for d in dates:
         for market in ['上市', '上櫃']:
@@ -943,36 +904,46 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
 
     return export_path
 
-# ================= 9. 執行進入點 =================
-if __name__ == "__main__":
+# ================= 9. Streamlit 進入點 =================
+def main():
+    st.title("📈 台股類股資金趨勢分析系統")
     env, device_type, data_dir = detect_runtime_and_device()
-    print("=" * 60)
-    print(f"【系統版本識別】: {VERSION_TAG}")
-    print(f"【當前執行環境】: {env}")
-    print(f"【終端裝置類型】: {device_type}")
-    print(f"【資料儲存目錄】: {data_dir}")
-    print("=" * 60)
 
-    conn = init_database(data_dir)
-    df_ind, df_stk, df_chips, df_map = load_or_sync_data(conn, target_valid_days=TARGET_DAYS)
-    df_gainers = sync_top_gainers_ratio(conn, df_stk, df_map)
+    with st.spinner("同步資料庫中，請稍候..."):
+        conn = init_database(data_dir)
+        df_ind, df_stk, df_chips, df_map = load_or_sync_data(conn, target_valid_days=TARGET_DAYS)
+        df_gainers = sync_top_gainers_ratio(conn, df_stk, df_map)
 
-    print("\n" + "=" * 40)
-    print("【請選擇欲檢視的類股日趨勢指標】:")
-    print("  [1] 全市場類股成交金額比率走勢圖 (%)")
-    print("  [2] 各類股外資買賣超金額走勢圖 (億元)")
-    print("  [3] 各類股三大法人合計買賣超金額走勢圖 (億元)")
-    print("  [4] 各類股主力籌碼指標走勢圖 (億元)")
-    print("  [5] 每日漲幅前100名個股產業佔比走勢圖 (%)")
-    print("=" * 40)
+    mode_options = {
+        "5": "5. 每日漲幅前100名個股產業佔比走勢圖 (%)",
+        "1": "1. 全市場類股成交金額比率走勢圖 (%)",
+        "2": "2. 各類股外資買賣超金額走勢圖 (億元)",
+        "3": "3. 各類股三大法人合計買賣超金額走勢圖 (億元)",
+        "4": "4. 各類股主力籌碼指標走勢圖 (億元)"
+    }
+    
+    selected_label = st.selectbox(
+        "請選擇檢視指標：", 
+        options=list(mode_options.values()), 
+        index=0
+    )
+    user_choice = [k for k, v in mode_options.items() if v == selected_label][0]
 
-    user_choice = input("請輸入選項編號 (1 / 2 / 3 / 4 / 5，直接 Enter 預設為 5): ").strip()
-    if user_choice not in ['1', '2', '3', '4', '5']:
-        user_choice = '5'
-
+    st.subheader("上市市場")
     render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上市', device_type, user_choice, chart_id='tw')
+    
+    st.subheader("上櫃市場")
     render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上櫃', device_type, user_choice, chart_id='tp')
 
     excel_path = export_excel(df_ind, df_stk, df_map, data_dir, user_choice)
-    print(f"\nExcel 報表產製完成，路徑: {excel_path}")
+    with open(excel_path, "rb") as f:
+        st.download_button(
+            label="📥 下載 Excel 分析報表",
+            data=f,
+            file_name=os.path.basename(excel_path),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     conn.close()
+
+if __name__ == "__main__":
+    main()
