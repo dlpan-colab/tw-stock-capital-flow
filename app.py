@@ -12,27 +12,51 @@ from typing import Tuple, List
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import streamlit as st
-import streamlit.components.v1 as components
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 
-# ================= 0. 版本識別與參數設定 =================
+# ================= 0. 環境偵測與安全匯入 =================
+IS_COLAB = "google.colab" in sys.modules
+
+try:
+    import streamlit as st
+    import streamlit.components.v1 as components
+except ImportError:
+    st = None
+    components = None
+
+if IS_COLAB:
+    from IPython.display import HTML, display
+
+# ================= 1. 版本識別與參數設定 =================
 tw_tz = zoneinfo.ZoneInfo("Asia/Taipei")
-VERSION_TAG = "v20261013_2142"
+VERSION_TAG = "v20261013_2158"
 RESET_STOCK_DATA = False
 TARGET_DAYS = 240
 EXCLUDE_PARENT_INDUSTRIES = ['合計', '總計', '電子', '電子類', '化學生技醫療']
 
-# ================= 1. Google Drive 資料庫同步 =================
-@st.cache_resource(ttl=1800, show_spinner="正在從 Google Drive 同步資料庫...")
+# Colab 表單互動參數 (在 Streamlit 中會由 st.selectbox 接管)
+# @title 台股類股資金趨勢分析系統 { run: "auto" }
+SELECTED_MODE_LABEL = "5. 每日漲幅前100名個股產業佔比走勢圖 (%)" # @param ["5. 每日漲幅前100名個股產業佔比走勢圖 (%)", "1. 全市場類股成交金額比率走勢圖 (%)", "2. 各類股外資買賣超金額走勢圖 (億元)", "3. 各類股三大法人合計買賣超金額走勢圖 (億元)", "4. 各類股主力籌碼指標走勢圖 (億元)"]
+
+# ================= 2. 跨環境快取包裝器 =================
+def cross_env_cache(*args, **kwargs):
+    def decorator(func):
+        if not IS_COLAB and st is not None:
+            return st.cache_resource(*args, **kwargs)(func)
+        return func
+    return decorator
+
+# ================= 3. Google Drive 資料庫同步 =================
+@cross_env_cache(ttl=1800, show_spinner="正在從 Google Drive 同步資料庫...")
 def sync_db_from_drive(local_db_path: str) -> bool:
-    """自 Google Drive 下載最新的 tw_market_data.db 至 Streamlit 本地環境"""
-    if "gcp_service_account" not in st.secrets:
+    """自 Google Drive 下載最新的 tw_market_data.db 至 Streamlit 環境"""
+    if st is None or "gcp_service_account" not in st.secrets:
         return False
 
     try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
+
         creds_info = dict(st.secrets["gcp_service_account"])
         creds = service_account.Credentials.from_service_account_info(
             creds_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
@@ -46,7 +70,8 @@ def sync_db_from_drive(local_db_path: str) -> bool:
         files = results.get("files", [])
 
         if not files:
-            st.warning("⚠️ Google Drive 資料夾中未搜尋到 tw_market_data.db")
+            if st is not None:
+                st.warning("⚠️ Google Drive 資料夾中未搜尋到 tw_market_data.db")
             return False
 
         file_id = files[0]["id"]
@@ -60,22 +85,42 @@ def sync_db_from_drive(local_db_path: str) -> bool:
                 _, done = downloader.next_chunk()
         return True
     except Exception as e:
-        st.error(f"從 Google Drive 同步資料庫時發生錯誤: {e}")
+        if st is not None:
+            st.error(f"從 Google Drive 同步資料庫時發生錯誤: {e}")
         return False
 
-# ================= 2. 環境偵測 =================
+# ================= 4. 執行環境偵測 =================
 def detect_runtime_environment() -> Tuple[str, str, str, bool]:
-    is_streamlit = True
-    env = 'Streamlit 部署環境'
-    data_dir = './data'
-    device_type = "手機 (Mobile)"
+    if IS_COLAB:
+        env = 'Google Colab 執行環境'
+        device_type = "電腦 (Desktop)"
+        is_streamlit = False
+        drive_mount_path = "/content/drive"
+        if not os.path.exists(f"{drive_mount_path}/MyDrive"):
+            try:
+                from google.colab import drive
+                drive.mount(drive_mount_path)
+            except Exception:
+                pass
+        
+        if os.path.exists("/content/drive/MyDrive"):
+            data_dir = "/content/drive/MyDrive/tw_stock_data"
+        else:
+            data_dir = "./data"
+    else:
+        env = 'Streamlit 部署環境'
+        data_dir = './data'
+        device_type = "手機 (Mobile)"
+        is_streamlit = True
+    
     os.makedirs(data_dir, exist_ok=True)
     return env, device_type, data_dir, is_streamlit
 
-# ================= 3. 資料庫初始化 =================
-def init_database(data_dir: str) -> sqlite3.Connection:
+# ================= 5. 資料庫初始化 =================
+def init_database(data_dir: str, is_streamlit: bool) -> sqlite3.Connection:
     db_path = os.path.join(data_dir, "tw_market_data.db")
-    sync_db_from_drive(db_path)
+    if is_streamlit:
+        sync_db_from_drive(db_path)
 
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cursor = conn.cursor()
@@ -169,7 +214,7 @@ def format_date_str(d_str: str) -> str:
     clean_d = str(d_str).replace('-', '').replace('/', '').strip()
     return f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}" if len(clean_d) == 8 else d_str
 
-# ================= 4. 產業對照表建立 =================
+# ================= 6. 產業對照表建立 =================
 def sync_stock_industry_map(conn: sqlite3.Connection) -> pd.DataFrame:
     df_existing = pd.read_sql("SELECT * FROM stock_industry_map", conn)
     if not df_existing.empty:
@@ -209,7 +254,7 @@ def sync_stock_industry_map(conn: sqlite3.Connection) -> pd.DataFrame:
         return df_map
     return pd.DataFrame()
 
-# ================= 5. 資料抓取與補齊 =================
+# ================= 7. 資料抓取與補齊 =================
 session = requests.Session()
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -415,7 +460,7 @@ def fetch_tpex_day_data(date_str: str, df_map: pd.DataFrame) -> Tuple[pd.DataFra
 
     return df_ind, df_stock, df_chips
 
-# ================= 6. 資料同步邏輯 =================
+# ================= 8. 資料同步邏輯 =================
 def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     cursor = conn.cursor()
     cursor.execute("DELETE FROM daily_industry_ratio WHERE date = '2026-10-09' OR trade_value <= 0")
@@ -506,7 +551,7 @@ def load_or_sync_data(conn: sqlite3.Connection, target_valid_days: int = 240) ->
 
     return df_hist_ind, df_hist_stock, df_hist_chips, df_map
 
-# ================= 7. 漲幅前 100 名產業佔比 =================
+# ================= 9. 漲幅前 100 名產業佔比 =================
 def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_map: pd.DataFrame) -> pd.DataFrame:
     cursor = conn.cursor()
     df_exist = pd.read_sql("SELECT * FROM daily_top_gainers_ratio", conn)
@@ -556,7 +601,7 @@ def sync_top_gainers_ratio(conn: sqlite3.Connection, df_stk: pd.DataFrame, df_ma
     df_final = pd.read_sql("SELECT * FROM daily_top_gainers_ratio", conn)
     return df_final
 
-# ================= 8. Plotly 圖表生成 =================
+# ================= 10. Plotly 圖表生成 =================
 def render_plotly_with_infobar(
     df_ind: pd.DataFrame, 
     df_stk: pd.DataFrame, 
@@ -598,7 +643,10 @@ def render_plotly_with_infobar(
             df_target['industry'] = df_target['clean_ind']
 
     if df_target.empty or 'date' not in df_target.columns:
-        st.info(f"{market_name} 查無相關資料")
+        if is_streamlit and st is not None:
+            st.info(f"{market_name} 查無相關資料")
+        else:
+            print(f"ℹ️ {market_name} 查無相關資料")
         return
 
     today_str = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d')
@@ -611,7 +659,10 @@ def render_plotly_with_infobar(
     dates = sorted(df_target['date'].dropna().unique().tolist())
     n_days = len(dates)
     if n_days == 0:
-        st.info(f"{market_name} 查無有效交易日")
+        if is_streamlit and st is not None:
+            st.info(f"{market_name} 查無有效交易日")
+        else:
+            print(f"ℹ️ {market_name} 查無有效交易日")
         return
 
     tick_texts = []
@@ -873,9 +924,12 @@ def render_plotly_with_infobar(
     }})();
     </script>
     """
-    components.html(wrapper_html, height=c_height + 80, scrolling=True)
+    if is_streamlit and components is not None:
+        components.html(wrapper_html, height=c_height + 80, scrolling=True)
+    elif IS_COLAB:
+        display(HTML(wrapper_html))
 
-# ================= 9. 匯出 Excel =================
+# ================= 11. 匯出 Excel =================
 def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFrame, data_dir: str, mode_option: str) -> str:
     now = datetime.datetime.now(tw_tz)
     mode_name_map = {
@@ -984,22 +1038,10 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
 
     return export_path
 
-# ================= 10. 主程式執行邏輯 =================
+# ================= 12. 主程式執行邏輯 =================
 def run():
-    st.set_page_config(page_title="台股類股資金趨勢", layout="wide")
-    
-    with st.sidebar:
-        st.header("⚙️ 系統設定")
-        if st.button("🔄 強制自雲端重新同步資料庫"):
-            st.cache_resource.clear()
-            st.rerun()
-
     env, device_type, data_dir, is_streamlit = detect_runtime_environment()
     
-    conn = init_database(data_dir)
-    df_ind, df_stk, df_chips, df_map = load_or_sync_data(conn, target_valid_days=TARGET_DAYS)
-    df_gainers = sync_top_gainers_ratio(conn, df_stk, df_map)
-
     mode_options = {
         "5": "5. 每日漲幅前100名個股產業佔比走勢圖 (%)",
         "1": "1. 全市場類股成交金額比率走勢圖 (%)",
@@ -1008,30 +1050,60 @@ def run():
         "4": "4. 各類股主力籌碼指標走勢圖 (億元)"
     }
 
-    st.title("📈 台股類股資金趨勢分析系統")
-    st.caption(f"系統核心版本：{VERSION_TAG}")
-    
-    selected_label = st.selectbox(
-        "請選擇檢視指標：", 
-        options=list(mode_options.values()), 
-        index=0
-    )
+    if is_streamlit and st is not None:
+        st.set_page_config(page_title="台股類股資金趨勢", layout="wide")
+        with st.sidebar:
+            st.header("⚙️ 系統設定")
+            if st.button("🔄 強制自雲端重新同步資料庫"):
+                st.cache_resource.clear()
+                st.rerun()
+
+        st.title("📈 台股類股資金趨勢分析系統")
+        st.caption(f"系統核心版本：{VERSION_TAG} ({env})")
+        
+        default_idx = list(mode_options.values()).index(SELECTED_MODE_LABEL) if SELECTED_MODE_LABEL in mode_options.values() else 0
+        selected_label = st.selectbox(
+            "請選擇檢視指標：", 
+            options=list(mode_options.values()), 
+            index=default_idx
+        )
+    else:
+        print("=" * 65)
+        print(f"📈 台股類股資金趨勢分析系統 | 核心版本：{VERSION_TAG} ({env})")
+        print("=" * 65)
+        selected_label = SELECTED_MODE_LABEL
+        print(f"當前檢視指標：{selected_label}")
+
     user_choice = [k for k, v in mode_options.items() if v == selected_label][0]
 
-    st.subheader("上市市場")
-    render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上市', device_type, user_choice, chart_id='tw', is_streamlit=True)
-    
-    st.subheader("上櫃市場")
-    render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上櫃', device_type, user_choice, chart_id='tp', is_streamlit=True)
+    conn = init_database(data_dir, is_streamlit)
+    df_ind, df_stk, df_chips, df_map = load_or_sync_data(conn, target_valid_days=TARGET_DAYS)
+    df_gainers = sync_top_gainers_ratio(conn, df_stk, df_map)
+
+    if is_streamlit and st is not None:
+        st.subheader("上市市場")
+    else:
+        print("\n【上市市場走勢圖】")
+    render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上市', device_type, user_choice, chart_id='tw', is_streamlit=is_streamlit)
+
+    if is_streamlit and st is not None:
+        st.subheader("上櫃市場")
+    else:
+        print("\n【上櫃市場走勢圖】")
+    render_plotly_with_infobar(df_ind, df_stk, df_chips, df_gainers, df_map, '上櫃', device_type, user_choice, chart_id='tp', is_streamlit=is_streamlit)
 
     excel_path = export_excel(df_ind, df_stk, df_map, data_dir, user_choice)
-    with open(excel_path, "rb") as f:
-        st.download_button(
-            label="📥 下載 Excel 分析報表",
-            data=f,
-            file_name=os.path.basename(excel_path),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    if is_streamlit and st is not None:
+        with open(excel_path, "rb") as f:
+            st.download_button(
+                label="📥 下載 Excel 分析報表",
+                data=f,
+                file_name=os.path.basename(excel_path),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    else:
+        print(f"✅ Excel 分析報表已產出至：{excel_path}")
+
     conn.close()
 
 if __name__ == "__main__":
