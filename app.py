@@ -20,7 +20,7 @@ from googleapiclient.http import MediaIoBaseDownload
 
 # ================= 0. 版本識別與參數設定 =================
 tw_tz = zoneinfo.ZoneInfo("Asia/Taipei")
-VERSION_TAG = "v20261013_2007"
+VERSION_TAG = "v20261013_2142"
 RESET_STOCK_DATA = False
 TARGET_DAYS = 240
 EXCLUDE_PARENT_INDUSTRIES = ['合計', '總計', '電子', '電子類', '化學生技醫療']
@@ -577,6 +577,7 @@ def render_plotly_with_infobar(
         '5': {'col': 'value_ratio', 'title': '漲幅前100名個股產業佔比 (%)', 'suffix': '%', 'scale': 1.0},
     }
     cfg = mode_configs.get(mode_option, mode_configs['1'])
+    is_percentage = mode_option in ['1', '5']
 
     if mode_option == '1':
         df_target = df_ind[
@@ -646,11 +647,14 @@ def render_plotly_with_infobar(
     if not df_recent.empty:
         y_min = float(df_recent['metric_val'].min())
         y_max = float(df_recent['metric_val'].max())
-        y_span = y_max - y_min
-        pad = y_span * 0.08 if y_span > 0 else 0.5
-        default_y_range = [y_min - pad, y_max + pad]
+        if is_percentage:
+            default_y_range = [0.0, max(y_max * 1.15, 5.0)]
+        else:
+            y_span = y_max - y_min
+            pad = y_span * 0.08 if y_span > 0 else 0.5
+            default_y_range = [y_min - pad, y_max + pad]
     else:
-        default_y_range = None
+        default_y_range = [0.0, 100.0] if is_percentage else None
 
     if not df_map.empty and not df_stk.empty and 'code' in df_stk.columns:
         if 'clean_ind' not in df_map.columns:
@@ -756,7 +760,8 @@ def render_plotly_with_infobar(
             ticksuffix=cfg['suffix'],
             range=default_y_range,
             autorange=False,
-            fixedrange=False,
+            fixedrange=True,
+            minallowed=0.0 if is_percentage else None,
             tickformat=".1f"
         ),
         hovermode="closest",
@@ -779,6 +784,8 @@ def render_plotly_with_infobar(
     )
 
     dict_json = json.dumps(daily_summary_dict, ensure_ascii=False)
+    is_pct_json = "true" if is_percentage else "false"
+
     wrapper_html = f"""
     <div style="width: 100%; margin-bottom: 25px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
         <div id="info_{chart_id}" style="width: 100%; min-height: 26px; padding: 6px 12px; box-sizing: border-box; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; font-size: 11px; font-family: monospace; color: #24292f; white-space: nowrap; overflow-x: auto; margin-bottom: 6px;">
@@ -789,8 +796,11 @@ def render_plotly_with_infobar(
     <script>
     (function() {{
         var dMap = {dict_json};
+        var isPct = {is_pct_json};
         var bar = document.getElementById("info_{chart_id}");
         var gd = document.getElementById("plotly_div_{chart_id}");
+        var isRelayouting = false;
+
         if (gd && bar) {{
             function updateBar(data) {{
                 if (data && data.points && data.points.length > 0) {{
@@ -802,6 +812,63 @@ def render_plotly_with_infobar(
             }}
             gd.on('plotly_hover', updateBar);
             gd.on('plotly_click', updateBar);
+
+            gd.on('plotly_relayout', function(eventData) {{
+                if (isRelayouting || !eventData) return;
+
+                var x0 = eventData['xaxis.range[0]'];
+                var x1 = eventData['xaxis.range[1]'];
+                if (x0 === undefined && eventData['xaxis.range']) {{
+                    x0 = eventData['xaxis.range'][0];
+                    x1 = eventData['xaxis.range'][1];
+                }}
+
+                if (x0 !== undefined && x1 !== undefined && gd.layout && gd.layout.xaxis) {{
+                    var allDates = gd.layout.xaxis.categoryarray || [];
+                    var sIdx = Math.max(0, Math.floor(typeof x0 === 'number' ? x0 : allDates.indexOf(x0)));
+                    var eIdx = Math.min(allDates.length - 1, Math.ceil(typeof x1 === 'number' ? x1 : allDates.indexOf(x1)));
+                    
+                    var visibleDateMap = {{}};
+                    for (var k = sIdx; k <= eIdx; k++) {{
+                        if (allDates[k]) visibleDateMap[allDates[k]] = true;
+                    }}
+
+                    var maxVal = -Infinity;
+                    var minVal = Infinity;
+                    var found = false;
+
+                    for (var i = 0; i < gd.data.length; i++) {{
+                        var tr = gd.data[i];
+                        if (tr.visible === 'legendonly' || !tr.y || !tr.x) continue;
+                        for (var j = 0; j < tr.x.length; j++) {{
+                            if (visibleDateMap[tr.x[j]]) {{
+                                var val = tr.y[j];
+                                if (val !== null && val !== undefined && !isNaN(val)) {{
+                                    if (val > maxVal) maxVal = val;
+                                    if (val < minVal) minVal = val;
+                                    found = true;
+                                }}
+                            }}
+                        }}
+                    }}
+
+                    if (found) {{
+                        var newYRange;
+                        if (isPct) {{
+                            newYRange = [0.0, maxVal > 0 ? maxVal * 1.15 : 5.0];
+                        }} else {{
+                            var span = maxVal - minVal;
+                            var pad = span > 0 ? span * 0.1 : 1.0;
+                            newYRange = [minVal - pad, maxVal + pad];
+                        }}
+
+                        isRelayouting = true;
+                        Plotly.relayout(gd, {{ 'yaxis.range': newYRange }}).then(function() {{
+                            isRelayouting = false;
+                        }});
+                    }}
+                }}
+            }});
         }}
     }})();
     </script>
@@ -921,7 +988,6 @@ def export_excel(df_ind: pd.DataFrame, df_stk: pd.DataFrame, df_map: pd.DataFram
 def run():
     st.set_page_config(page_title="台股類股資金趨勢", layout="wide")
     
-    # 側邊欄：重新整理與設定
     with st.sidebar:
         st.header("⚙️ 系統設定")
         if st.button("🔄 強制自雲端重新同步資料庫"):
